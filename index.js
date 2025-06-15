@@ -1,47 +1,16 @@
 const express = require('express');
 const cron = require('node-cron');
 const mqtt = require('mqtt');
-const sqlite3 = require('sqlite3').verbose();
 const dotenv = require('dotenv');
-const { open } = require('sqlite');
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-// Initialize SQLite
-let db;
-async function initializeDatabase() {
-  try {
-    db = await open({
-      filename: './schedules.db',
-      driver: sqlite3.Database,
-    });
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS schedules (
-        id TEXT PRIMARY KEY,
-        deviceId TEXT,
-        roomId TEXT,
-        topic TEXT,
-        deviceName TEXT,
-        action TEXT,
-        time INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS devices (
-        deviceId TEXT PRIMARY KEY,
-        roomId TEXT,
-        topic TEXT,
-        deviceName TEXT,
-        status TEXT
-      );
-    `);
-    console.log('Database initialized');
-  } catch (err) {
-    console.error('Error initializing database:', err);
-    process.exit(1);
-  }
-}
+// In-memory storage for Render compatibility
+let devices = new Map();
+let schedules = new Map();
 
 // Validate MQTT topic format
 function isValidTopic(topic) {
@@ -57,9 +26,10 @@ function initializeMQTT() {
     username: process.env.MQTT_USER,
     password: process.env.MQTT_PASSWORD,
     clientId: `server_${Date.now()}`,
-    rejectUnauthorized: false, // Set to true if using proper SSL certificates
+    rejectUnauthorized: false,
     reconnectPeriod: 5000,
     connectTimeout: 30000,
+    keepalive: 60,
   };
 
   mqttClient = mqtt.connect(process.env.MQTT_BROKER, mqttOptions);
@@ -67,17 +37,15 @@ function initializeMQTT() {
   mqttClient.on('connect', async () => {
     console.log('Connected to MQTT broker');
     try {
-      if (db) {
-        const devices = await db.all('SELECT topic FROM devices');
-        devices.forEach(({ topic }) => {
-          if (isValidTopic(topic)) {
-            mqttClient.subscribe(topic, (err) => {
-              if (err) console.error(`Error subscribing to ${topic}:`, err);
-              else console.log(`Subscribed to ${topic}`);
-            });
-          }
-        });
-      }
+      // Subscribe to all registered device topics
+      devices.forEach((device) => {
+        if (isValidTopic(device.topic)) {
+          mqttClient.subscribe(device.topic, (err) => {
+            if (err) console.error(`Error subscribing to ${device.topic}:`, err);
+            else console.log(`Subscribed to ${device.topic}`);
+          });
+        }
+      });
     } catch (err) {
       console.error('Error subscribing to device topics:', err);
     }
@@ -87,8 +55,13 @@ function initializeMQTT() {
     if (isValidTopic(topic)) {
       const status = message.toString().toLowerCase();
       try {
-        await db.run('UPDATE devices SET status = ? WHERE topic = ?', [status, topic]);
-        console.log(`Updated device status for ${topic}: ${status}`);
+        // Update device status in memory
+        devices.forEach((device, deviceId) => {
+          if (device.topic === topic) {
+            device.status = status;
+            console.log(`Updated device status for ${topic}: ${status}`);
+          }
+        });
       } catch (err) {
         console.error(`Error updating device status for ${topic}:`, err);
       }
@@ -108,93 +81,154 @@ function initializeMQTT() {
   });
 }
 
-// Store active cron jobs
+// Store active cron jobs and timeouts
 const cronJobs = new Map();
+const scheduleTimeouts = new Map();
 
-// Load schedules
-async function loadSchedules() {
-  try {
-    const schedules = await db.all('SELECT * FROM schedules');
-    console.log(`Loading ${schedules.length} schedules`);
-    schedules.forEach((schedule) => {
-      // Check if schedule time is in the future
-      const scheduleTime = new Date(schedule.time);
-      const now = new Date();
-      if (scheduleTime > now) {
-        scheduleCronJob(schedule.id, schedule);
-      } else {
-        // Remove expired schedules
-        console.log(`Removing expired schedule: ${schedule.id}`);
-        db.run('DELETE FROM schedules WHERE id = ?', schedule.id).catch(err => {
-          console.error(`Error deleting expired schedule ${schedule.id}:`, err);
-        });
-      }
-    });
-  } catch (err) {
-    console.error('Error loading schedules:', err);
-  }
-}
-
-// Schedule a cron job
-function scheduleCronJob(scheduleId, schedule) {
+// Schedule execution using setTimeout (more reliable on Render)
+function scheduleExecution(scheduleId, schedule) {
   const { time, action, topic } = schedule;
   const scheduleTime = new Date(time);
   const now = new Date();
 
   // Validate schedule time is in the future
   if (scheduleTime <= now) {
-    console.log(`Schedule ${scheduleId} is in the past, skipping`);
+    console.log(`Schedule ${scheduleId} is in the past, removing`);
+    schedules.delete(scheduleId);
     return;
   }
 
-  // Create cron expression for the specific date and time
-  const cronExpression = `${scheduleTime.getSeconds()} ${scheduleTime.getMinutes()} ${scheduleTime.getHours()} ${scheduleTime.getDate()} ${scheduleTime.getMonth() + 1} *`;
+  const delay = scheduleTime.getTime() - now.getTime();
+  
+  // Use setTimeout for near-term schedules (within 24 hours)
+  if (delay <= 24 * 60 * 60 * 1000) {
+    console.log(`Scheduling execution for ${scheduleId} in ${Math.round(delay / 1000)} seconds`);
+    
+    const timeoutId = setTimeout(async () => {
+      try {
+        console.log(`Executing schedule ${scheduleId}: ${action} on ${topic}`);
+        
+        if (!isValidTopic(topic)) {
+          throw new Error(`Invalid topic: ${topic}`);
+        }
 
-  console.log(`Scheduling job ${scheduleId} with cron: ${cronExpression}`);
+        // Publish MQTT message
+        if (mqttClient && mqttClient.connected) {
+          mqttClient.publish(topic, action, { qos: 0 }, (err) => {
+            if (err) {
+              console.error(`Error publishing to ${topic}:`, err);
+            } else {
+              console.log(`Published ${action} to ${topic}`);
+            }
+          });
+        } else {
+          console.error('MQTT client not connected');
+        }
 
-  const job = cron.schedule(cronExpression, async () => {
-    try {
-      console.log(`Executing schedule ${scheduleId}: ${action} on ${topic}`);
-      
-      if (!isValidTopic(topic)) {
-        throw new Error(`Invalid topic: ${topic}`);
-      }
-
-      // Publish MQTT message
-      if (mqttClient && mqttClient.connected) {
-        mqttClient.publish(topic, action, { qos: 0 }, (err) => {
-          if (err) {
-            console.error(`Error publishing to ${topic}:`, err);
-          } else {
-            console.log(`Published ${action} to ${topic}`);
+        // Update device status in memory
+        devices.forEach((device, deviceId) => {
+          if (device.topic === topic) {
+            device.status = action;
           }
         });
-      } else {
-        console.error('MQTT client not connected');
+        
+        // Remove the executed schedule
+        schedules.delete(scheduleId);
+        scheduleTimeouts.delete(scheduleId);
+        
+        console.log(`Schedule ${scheduleId} executed and removed`);
+      } catch (err) {
+        console.error(`Error executing schedule ${scheduleId}:`, err);
       }
+    }, delay);
 
-      // Update device status in database
-      await db.run('UPDATE devices SET status = ? WHERE topic = ?', [action, topic]);
-      
-      // Remove the executed schedule
-      await db.run('DELETE FROM schedules WHERE id = ?', scheduleId);
-      
-      // Clean up cron job
-      cronJobs.delete(scheduleId);
-      job.stop();
-      
-      console.log(`Schedule ${scheduleId} executed and removed`);
-    } catch (err) {
-      console.error(`Error executing schedule ${scheduleId}:`, err);
-    }
-  }, {
-    scheduled: true,
-    timezone: "UTC" // Specify timezone explicitly
-  });
+    scheduleTimeouts.set(scheduleId, timeoutId);
+  } else {
+    // For longer-term schedules, use cron with daily check
+    const cronExpression = `${scheduleTime.getSeconds()} ${scheduleTime.getMinutes()} ${scheduleTime.getHours()} ${scheduleTime.getDate()} ${scheduleTime.getMonth() + 1} *`;
+    
+    console.log(`Scheduling cron job ${scheduleId} with expression: ${cronExpression}`);
 
-  cronJobs.set(scheduleId, job);
-  console.log(`Cron job scheduled for ${scheduleId} at ${scheduleTime}`);
+    const job = cron.schedule(cronExpression, async () => {
+      try {
+        console.log(`Executing schedule ${scheduleId}: ${action} on ${topic}`);
+        
+        if (!isValidTopic(topic)) {
+          throw new Error(`Invalid topic: ${topic}`);
+        }
+
+        // Publish MQTT message
+        if (mqttClient && mqttClient.connected) {
+          mqttClient.publish(topic, action, { qos: 0 }, (err) => {
+            if (err) {
+              console.error(`Error publishing to ${topic}:`, err);
+            } else {
+              console.log(`Published ${action} to ${topic}`);
+            }
+          });
+        } else {
+          console.error('MQTT client not connected');
+        }
+
+        // Update device status in memory
+        devices.forEach((device, deviceId) => {
+          if (device.topic === topic) {
+            device.status = action;
+          }
+        });
+        
+        // Remove the executed schedule
+        schedules.delete(scheduleId);
+        cronJobs.delete(scheduleId);
+        job.stop();
+        
+        console.log(`Schedule ${scheduleId} executed and removed`);
+      } catch (err) {
+        console.error(`Error executing schedule ${scheduleId}:`, err);
+      }
+    }, {
+      scheduled: true,
+      timezone: "UTC"
+    });
+
+    cronJobs.set(scheduleId, job);
+  }
+
+  console.log(`Schedule ${scheduleId} set for ${scheduleTime.toISOString()}`);
 }
+
+// Cleanup expired schedules periodically
+function cleanupExpiredSchedules() {
+  const now = new Date();
+  const expired = [];
+  
+  schedules.forEach((schedule, scheduleId) => {
+    if (new Date(schedule.time) <= now) {
+      expired.push(scheduleId);
+    }
+  });
+  
+  expired.forEach(scheduleId => {
+    console.log(`Removing expired schedule: ${scheduleId}`);
+    schedules.delete(scheduleId);
+    
+    // Clean up associated jobs/timeouts
+    const job = cronJobs.get(scheduleId);
+    if (job) {
+      job.stop();
+      cronJobs.delete(scheduleId);
+    }
+    
+    const timeoutId = scheduleTimeouts.get(scheduleId);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      scheduleTimeouts.delete(scheduleId);
+    }
+  });
+}
+
+// Clean up expired schedules every hour
+setInterval(cleanupExpiredSchedules, 60 * 60 * 1000);
 
 // API: Register a device
 app.post('/devices', async (req, res) => {
@@ -209,10 +243,15 @@ app.post('/devices', async (req, res) => {
       return res.status(400).json({ error: 'Invalid topic format' });
     }
 
-    await db.run(
-      'INSERT OR REPLACE INTO devices (deviceId, roomId, topic, deviceName, status) VALUES (?, ?, ?, ?, ?)',
-      [deviceId, roomId, topic, deviceName, 'off']
-    );
+    const device = {
+      deviceId,
+      roomId,
+      topic,
+      deviceName,
+      status: 'off'
+    };
+
+    devices.set(deviceId, device);
 
     // Subscribe to the device topic
     if (mqttClient && mqttClient.connected) {
@@ -261,22 +300,18 @@ app.post('/schedules', async (req, res) => {
     }
 
     const scheduleId = `${deviceId}_${Date.now()}`;
-    const scheduleTimeMs = scheduleTime.getTime();
+    const schedule = {
+      id: scheduleId,
+      deviceId,
+      roomId,
+      topic,
+      deviceName,
+      action: action.toLowerCase(),
+      time: scheduleTime.getTime()
+    };
 
-    await db.run(
-      'INSERT INTO schedules (id, deviceId, roomId, topic, deviceName, action, time) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [scheduleId, deviceId, roomId, topic, deviceName, action.toLowerCase(), scheduleTimeMs]
-    );
-
-    scheduleCronJob(scheduleId, { 
-      id: scheduleId, 
-      deviceId, 
-      roomId, 
-      topic, 
-      deviceName, 
-      action: action.toLowerCase(), 
-      time: scheduleTimeMs 
-    });
+    schedules.set(scheduleId, schedule);
+    scheduleExecution(scheduleId, schedule);
 
     res.status(201).json({ 
       scheduleId,
@@ -294,17 +329,25 @@ app.delete('/schedules/:scheduleId', async (req, res) => {
   try {
     const { scheduleId } = req.params;
     
-    const schedule = await db.get('SELECT * FROM schedules WHERE id = ?', scheduleId);
+    const schedule = schedules.get(scheduleId);
     if (!schedule) {
       return res.status(404).json({ error: 'Schedule not found' });
     }
 
-    await db.run('DELETE FROM schedules WHERE id = ?', scheduleId);
+    schedules.delete(scheduleId);
     
+    // Clean up cron job
     const job = cronJobs.get(scheduleId);
     if (job) {
       job.stop();
       cronJobs.delete(scheduleId);
+    }
+    
+    // Clean up timeout
+    const timeoutId = scheduleTimeouts.get(scheduleId);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      scheduleTimeouts.delete(scheduleId);
     }
 
     res.status(200).json({ message: 'Schedule deleted successfully' });
@@ -318,15 +361,18 @@ app.delete('/schedules/:scheduleId', async (req, res) => {
 app.get('/schedules/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const schedules = await db.all('SELECT * FROM schedules WHERE deviceId = ?', deviceId);
+    const deviceSchedules = [];
     
-    // Convert timestamps to readable dates
-    const formattedSchedules = schedules.map(schedule => ({
-      ...schedule,
-      scheduledTime: new Date(schedule.time).toISOString()
-    }));
+    schedules.forEach((schedule) => {
+      if (schedule.deviceId === deviceId) {
+        deviceSchedules.push({
+          ...schedule,
+          scheduledTime: new Date(schedule.time).toISOString()
+        });
+      }
+    });
 
-    res.status(200).json(formattedSchedules);
+    res.status(200).json(deviceSchedules);
   } catch (err) {
     console.error('Error fetching schedules:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -336,14 +382,14 @@ app.get('/schedules/:deviceId', async (req, res) => {
 // API: Get all schedules
 app.get('/schedules', async (req, res) => {
   try {
-    const schedules = await db.all('SELECT * FROM schedules ORDER BY time ASC');
-    
-    const formattedSchedules = schedules.map(schedule => ({
-      ...schedule,
-      scheduledTime: new Date(schedule.time).toISOString()
-    }));
+    const allSchedules = Array.from(schedules.values())
+      .map(schedule => ({
+        ...schedule,
+        scheduledTime: new Date(schedule.time).toISOString()
+      }))
+      .sort((a, b) => a.time - b.time);
 
-    res.status(200).json(formattedSchedules);
+    res.status(200).json(allSchedules);
   } catch (err) {
     console.error('Error fetching all schedules:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -354,7 +400,7 @@ app.get('/schedules', async (req, res) => {
 app.get('/devices/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const device = await db.get('SELECT * FROM devices WHERE deviceId = ?', deviceId);
+    const device = devices.get(deviceId);
     
     if (!device) {
       return res.status(404).json({ error: 'Device not found' });
@@ -370,10 +416,54 @@ app.get('/devices/:deviceId', async (req, res) => {
 // API: Get all devices
 app.get('/devices', async (req, res) => {
   try {
-    const devices = await db.all('SELECT * FROM devices ORDER BY deviceName ASC');
-    res.status(200).json(devices);
+    const allDevices = Array.from(devices.values())
+      .sort((a, b) => a.deviceName.localeCompare(b.deviceName));
+    
+    res.status(200).json(allDevices);
   } catch (err) {
     console.error('Error fetching devices:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// API: Manual device control
+app.post('/devices/:deviceId/control', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { action } = req.body;
+    
+    if (!['on', 'off'].includes(action?.toLowerCase())) {
+      return res.status(400).json({ error: 'Invalid action: must be "on" or "off"' });
+    }
+    
+    const device = devices.get(deviceId);
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+
+    const normalizedAction = action.toLowerCase();
+    
+    // Publish MQTT message
+    if (mqttClient && mqttClient.connected) {
+      mqttClient.publish(device.topic, normalizedAction, { qos: 0 }, (err) => {
+        if (err) {
+          console.error(`Error publishing to ${device.topic}:`, err);
+          return res.status(500).json({ error: 'Failed to send command' });
+        } else {
+          console.log(`Published ${normalizedAction} to ${device.topic}`);
+          // Update device status
+          device.status = normalizedAction;
+          res.status(200).json({ 
+            message: 'Command sent successfully', 
+            device: device 
+          });
+        }
+      });
+    } else {
+      res.status(503).json({ error: 'MQTT client not connected' });
+    }
+  } catch (err) {
+    console.error('Error controlling device:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -382,11 +472,19 @@ app.get('/devices', async (req, res) => {
 app.get('/health', (req, res) => {
   const status = {
     server: 'running',
-    database: db ? 'connected' : 'disconnected',
     mqtt: mqttClient && mqttClient.connected ? 'connected' : 'disconnected',
-    activeSchedules: cronJobs.size
+    devices: devices.size,
+    activeSchedules: schedules.size,
+    cronJobs: cronJobs.size,
+    timeouts: scheduleTimeouts.size,
+    uptime: process.uptime()
   };
   res.status(200).json(status);
+});
+
+// Keep-alive endpoint for Render
+app.get('/ping', (req, res) => {
+  res.status(200).json({ message: 'pong', timestamp: new Date().toISOString() });
 });
 
 // Graceful shutdown
@@ -399,32 +497,44 @@ process.on('SIGINT', async () => {
     console.log(`Stopped cron job: ${scheduleId}`);
   });
   cronJobs.clear();
+  
+  // Clear all timeouts
+  scheduleTimeouts.forEach((timeoutId, scheduleId) => {
+    clearTimeout(timeoutId);
+    console.log(`Cleared timeout: ${scheduleId}`);
+  });
+  scheduleTimeouts.clear();
 
   // Close MQTT connection
   if (mqttClient) {
     mqttClient.end();
   }
 
-  // Close database connection
-  if (db) {
-    await db.close();
-  }
-
   process.exit(0);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  process.exit(1);
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Initialize everything in the correct order
-async function startServer() {
+// Initialize everything
+function startServer() {
   try {
-    await initializeDatabase();
     initializeMQTT();
-    await loadSchedules();
     
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server running on port ${PORT}`);
       console.log(`Health check available at http://localhost:${PORT}/health`);
+      console.log(`Ping endpoint available at http://localhost:${PORT}/ping`);
     });
   } catch (err) {
     console.error('Failed to start server:', err);
