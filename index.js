@@ -28,23 +28,30 @@ function parseTimeWithTimezone(timeInput, timezoneOffset) {
     if (timeInput.includes('T') && (timeInput.includes('Z') || timeInput.includes('+') || timeInput.includes('-'))) {
       parsedTime = new Date(timeInput);
     } else {
-      // Treat as local time string and parse
-      parsedTime = new Date(timeInput);
+      // For strings without timezone info, we need to be more explicit
+      // Check if it looks like an ISO string without timezone
+      if (timeInput.includes('T')) {
+        // If no timezone offset is provided, treat the time as if it's already in the client's intended timezone
+        // This means the client sent their local time, so we parse it as UTC first
+        parsedTime = new Date(timeInput.endsWith('Z') ? timeInput : timeInput + 'Z');
+        
+        // If timezone offset is provided, we need to adjust from the client's timezone to UTC
+        if (typeof timezoneOffset === 'number') {
+          // The client sent their local time, so we need to convert it to UTC
+          // timezoneOffset is the client's offset from UTC in minutes
+          const offsetMs = timezoneOffset * 60 * 1000;
+          parsedTime = new Date(parsedTime.getTime() - offsetMs);
+        }
+      } else {
+        // Regular date string parsing
+        parsedTime = new Date(timeInput);
+      }
     }
   } else if (typeof timeInput === 'number') {
     // Treat as timestamp
     parsedTime = new Date(timeInput);
   } else {
     throw new Error('Invalid time format');
-  }
-
-  // If timezone offset is provided (in minutes), convert to UTC
-  if (typeof timezoneOffset === 'number') {
-    // Note: JavaScript getTimezoneOffset() returns positive values for timezones west of UTC
-    // But we expect the client to send negative values for timezones west of UTC (standard convention)
-    // So we subtract the offset to convert local time to UTC
-    const offsetMs = timezoneOffset * 60 * 1000;
-    parsedTime = new Date(parsedTime.getTime() - offsetMs);
   }
 
   return parsedTime;
@@ -239,46 +246,7 @@ function cleanupExpiredSchedules() {
 // Clean up expired schedules every hour
 setInterval(cleanupExpiredSchedules, 60 * 60 * 1000);
 
-// API: Register a device
-app.post('/devices', async (req, res) => {
-  try {
-    const { deviceId, roomId, topic, deviceName } = req.body;
-    
-    if (!deviceId || !roomId || !topic || !deviceName) {
-      return res.status(400).json({ error: 'Missing required fields: deviceId, roomId, topic, deviceName' });
-    }
 
-    if (!isValidTopic(topic)) {
-      return res.status(400).json({ error: 'Invalid topic format' });
-    }
-
-    const device = {
-      deviceId,
-      roomId,
-      topic,
-      deviceName,
-      status: 'off'
-    };
-
-    devices.set(deviceId, device);
-
-    // Subscribe to the device topic
-    if (mqttClient && mqttClient.connected) {
-      mqttClient.subscribe(topic, (err) => {
-        if (err) {
-          console.error(`Error subscribing to ${topic}:`, err);
-        } else {
-          console.log(`Subscribed to ${topic}`);
-        }
-      });
-    }
-
-    res.status(201).json({ message: 'Device registered successfully' });
-  } catch (err) {
-    console.error('Error registering device:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 // API: Create a schedule with universal timezone support
 app.post('/schedules', async (req, res) => {
@@ -319,10 +287,16 @@ app.post('/schedules', async (req, res) => {
     console.log('Creating schedule with universal timezone support:');
     console.log(`  Current UTC time: ${now.toISOString()}`);
     console.log(`  Original time input: ${time}`);
-    console.log(`  Timezone offset: ${timezone || 'auto-detected/none'} minutes`);
+    console.log(`  Client timezone offset: ${timezone !== undefined ? timezone : 'not provided'} minutes`);
     console.log(`  Parsed schedule time (UTC): ${scheduleTime.toISOString()}`);
     console.log(`  Time difference: ${scheduleTime.getTime() - now.getTime()}ms`);
     console.log(`  Minutes until execution: ${Math.round((scheduleTime.getTime() - now.getTime()) / 60000)}`);
+    
+    // Additional debugging for timezone issues
+    if (typeof timezone === 'number') {
+      const clientLocalTime = new Date(scheduleTime.getTime() + (timezone * 60 * 1000));
+      console.log(`  Client's local time would be: ${clientLocalTime.toISOString()}`);
+    }
 
     if (isNaN(scheduleTime.getTime())) {
       return res.status(400).json({ error: 'Invalid time format - could not parse date' });
@@ -452,78 +426,6 @@ app.get('/schedules', async (req, res) => {
     res.status(200).json(allSchedules);
   } catch (err) {
     console.error('Error fetching all schedules:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// API: Get device status
-app.get('/devices/:deviceId', async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const device = devices.get(deviceId);
-    
-    if (!device) {
-      return res.status(404).json({ error: 'Device not found' });
-    }
-
-    res.status(200).json(device);
-  } catch (err) {
-    console.error('Error fetching device:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// API: Get all devices
-app.get('/devices', async (req, res) => {
-  try {
-    const allDevices = Array.from(devices.values())
-      .sort((a, b) => a.deviceName.localeCompare(b.deviceName));
-    
-    res.status(200).json(allDevices);
-  } catch (err) {
-    console.error('Error fetching devices:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// API: Manual device control
-app.post('/devices/:deviceId/control', async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const { action } = req.body;
-    
-    if (!['on', 'off'].includes(action?.toLowerCase())) {
-      return res.status(400).json({ error: 'Invalid action: must be "on" or "off"' });
-    }
-    
-    const device = devices.get(deviceId);
-    if (!device) {
-      return res.status(404).json({ error: 'Device not found' });
-    }
-
-    const normalizedAction = action.toLowerCase();
-    
-    // Publish MQTT message
-    if (mqttClient && mqttClient.connected) {
-      mqttClient.publish(device.topic, normalizedAction, { qos: 0 }, (err) => {
-        if (err) {
-          console.error(`Error publishing to ${device.topic}:`, err);
-          return res.status(500).json({ error: 'Failed to send command' });
-        } else {
-          console.log(`Published ${normalizedAction} to ${device.topic}`);
-          // Update device status
-          device.status = normalizedAction;
-          res.status(200).json({ 
-            message: 'Command sent successfully', 
-            device: device 
-          });
-        }
-      });
-    } else {
-      res.status(503).json({ error: 'MQTT client not connected' });
-    }
-  } catch (err) {
-    console.error('Error controlling device:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
