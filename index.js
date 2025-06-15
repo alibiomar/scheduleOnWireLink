@@ -227,7 +227,7 @@ app.post('/devices', async (req, res) => {
 // API: Create a schedule
 app.post('/schedules', async (req, res) => {
   try {
-    const { deviceId, roomId, topic, deviceName, action, time } = req.body;
+    const { deviceId, roomId, topic, deviceName, action, time, timezone } = req.body;
     
     if (!deviceId || !roomId || !topic || !deviceName || !action || !time) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -241,24 +241,44 @@ app.post('/schedules', async (req, res) => {
       return res.status(400).json({ error: 'Invalid action: must be "on" or "off"' });
     }
 
-    const scheduleTime = new Date(time);
+    // Parse the time - handle both ISO strings and timestamps
+    let scheduleTime;
+    if (typeof time === 'string') {
+      scheduleTime = new Date(time);
+    } else {
+      scheduleTime = new Date(time);
+    }
+
+    // If timezone offset is provided, adjust the time
+    if (timezone !== undefined) {
+      const offsetMs = timezone * 60 * 1000;
+      scheduleTime = new Date(scheduleTime.getTime() - offsetMs);
+    }
+
     const now = new Date();
 
     console.log('Creating schedule:');
-    console.log(`  Current time: ${now.toISOString()}`);
-    console.log(`  Schedule time: ${scheduleTime.toISOString()}`);
+    console.log(`  Current time (UTC): ${now.toISOString()}`);
+    console.log(`  Original time: ${time}`);
+    console.log(`  Parsed schedule time (UTC): ${scheduleTime.toISOString()}`);
+    console.log(`  Timezone offset: ${timezone || 'none'} minutes`);
     console.log(`  Time difference: ${scheduleTime.getTime() - now.getTime()}ms`);
+    console.log(`  Minutes until execution: ${Math.round((scheduleTime.getTime() - now.getTime()) / 60000)}`);
 
     if (isNaN(scheduleTime.getTime())) {
       return res.status(400).json({ error: 'Invalid time format' });
     }
 
-    if (scheduleTime <= now) {
-      console.log(`Schedule time ${scheduleTime.toISOString()} is not in the future (current: ${now.toISOString()})`);
+    // Add a small buffer (10 seconds) to account for processing time
+    const minimumFutureTime = new Date(now.getTime() + 10000);
+    
+    if (scheduleTime <= minimumFutureTime) {
+      console.log(`Schedule time ${scheduleTime.toISOString()} is not sufficiently in the future (minimum: ${minimumFutureTime.toISOString()})`);
       return res.status(400).json({ 
-        error: 'Schedule time must be in the future',
+        error: 'Schedule time must be at least 10 seconds in the future',
         currentTime: now.toISOString(),
-        scheduleTime: scheduleTime.toISOString()
+        scheduleTime: scheduleTime.toISOString(),
+        minimumTime: minimumFutureTime.toISOString()
       });
     }
 
@@ -283,7 +303,9 @@ app.post('/schedules', async (req, res) => {
       message: 'Schedule created successfully',
       scheduledTime: scheduleTime.toISOString(),
       currentTime: now.toISOString(),
-      delayMinutes: Math.round((scheduleTime.getTime() - now.getTime()) / 60000)
+      delayMinutes: Math.round((scheduleTime.getTime() - now.getTime()) / 60000),
+      originalTime: time,
+      timezoneOffset: timezone || 0
     });
   } catch (err) {
     console.error('Error creating schedule:', err);
