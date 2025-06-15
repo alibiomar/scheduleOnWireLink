@@ -2,8 +2,23 @@ const express = require('express');
 const cron = require('node-cron');
 const mqtt = require('mqtt');
 const dotenv = require('dotenv');
+const admin = require('firebase-admin'); // Add Firebase Admin SDK
 
 dotenv.config();
+
+// Initialize Firebase Admin SDK
+let firebaseApp;
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+  firebaseApp = admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+  console.log('Firebase Admin SDK initialized successfully');
+} catch (err) {
+  console.error('Failed to initialize Firebase Admin SDK:', err);
+}
+
+const db = firebaseApp ? admin.firestore() : null;
 
 const app = express();
 app.use(express.json());
@@ -24,21 +39,17 @@ function parseTimeWithTimezone(timeInput, timezoneOffset) {
 
   try {
     if (typeof timeInput === 'string') {
-      // Handle ISO string
       parsedTime = new Date(timeInput);
 
       if (isNaN(parsedTime.getTime())) {
         throw new Error('Invalid time format');
       }
 
-      // If timezoneOffset is provided (in minutes), adjust to UTC
       if (typeof timezoneOffset === 'number') {
         const offsetMs = timezoneOffset * 60 * 1000;
-        // Subtract the client's timezone offset to convert local time to UTC
         parsedTime = new Date(parsedTime.getTime() - offsetMs);
       }
     } else if (typeof timeInput === 'number') {
-      // Treat as timestamp (assumed to be UTC)
       parsedTime = new Date(timeInput);
     } else {
       throw new Error('Invalid time format');
@@ -56,8 +67,7 @@ function parseTimeWithTimezone(timeInput, timezoneOffset) {
 
 function formatTimeForResponse(utcTimestamp, clientTimezoneOffset) {
   const utcTime = new Date(utcTimestamp);
-  
-  // If client timezone offset is provided, show time in client's timezone
+
   if (typeof clientTimezoneOffset === 'number') {
     const localTime = new Date(utcTime.getTime() + (clientTimezoneOffset * 60 * 1000));
     return {
@@ -66,7 +76,7 @@ function formatTimeForResponse(utcTimestamp, clientTimezoneOffset) {
       timezone: `UTC${clientTimezoneOffset >= 0 ? '+' : ''}${Math.floor(clientTimezoneOffset / 60)}:${Math.abs(clientTimezoneOffset % 60).toString().padStart(2, '0')}`
     };
   }
-  
+
   return {
     utc: utcTime.toISOString(),
     local: utcTime.toISOString(),
@@ -97,7 +107,6 @@ function initializeMQTT() {
   mqttClient.on('connect', async () => {
     console.log('Connected to MQTT broker');
     try {
-      // Subscribe to all registered device topics
       devices.forEach((device) => {
         if (isValidTopic(device.topic)) {
           mqttClient.subscribe(device.topic, (err) => {
@@ -115,7 +124,6 @@ function initializeMQTT() {
     if (isValidTopic(topic)) {
       const status = message.toString().toLowerCase();
       try {
-        // Update device status in memory
         devices.forEach((device, deviceId) => {
           if (device.topic === topic) {
             device.status = status;
@@ -145,9 +153,9 @@ function initializeMQTT() {
 const cronJobs = new Map();
 const scheduleTimeouts = new Map();
 
-// Schedule execution using setTimeout (more reliable on Render)
-function scheduleExecution(scheduleId, schedule) {
-  const { time, action, topic } = schedule;
+// Schedule execution using setTimeout
+async function scheduleExecution(scheduleId, schedule) {
+  const { time, action, topic, deviceId, roomId } = schedule;
   const scheduleTime = new Date(time);
   const now = getCurrentUTCTime();
 
@@ -156,21 +164,19 @@ function scheduleExecution(scheduleId, schedule) {
   console.log(`  Schedule UTC time: ${scheduleTime.toISOString()}`);
   console.log(`  Action: ${action} on ${topic}`);
 
-  // Validate schedule time is in the future
   if (scheduleTime <= now) {
-    console.log(`Schedule ${scheduleId} is in the past (${scheduleTime.toISOString()} <= ${now.toISOString()}), removing`);
+    console.log(`Schedule ${scheduleId} is in the past, removing`);
     schedules.delete(scheduleId);
     return;
   }
 
   const delay = scheduleTime.getTime() - now.getTime();
-  console.log(`Schedule ${scheduleId} will execute in ${Math.round(delay / 1000)} seconds (${Math.round(delay / 60000)} minutes)`);
-  
-  // Use setTimeout for schedules (more reliable than cron on cloud platforms)
+  console.log(`Schedule ${scheduleId} will execute in ${Math.round(delay / 1000)} seconds`);
+
   const timeoutId = setTimeout(async () => {
     try {
       console.log(`Executing schedule ${scheduleId}: ${action} on ${topic}`);
-      
+
       if (!isValidTopic(topic)) {
         throw new Error(`Invalid topic: ${topic}`);
       }
@@ -189,17 +195,49 @@ function scheduleExecution(scheduleId, schedule) {
       }
 
       // Update device status in memory
-      devices.forEach((device, deviceId) => {
+      devices.forEach((device, devId) => {
         if (device.topic === topic) {
           device.status = action;
-          console.log(`Updated device ${deviceId} status to ${action}`);
+          console.log(`Updated device ${devId} status to ${action}`);
         }
       });
-      
+
+      // Update device status in Firestore
+      if (db) {
+        try {
+          // Assume device is stored under users/{userId}/rooms/{roomId}/devices/{deviceId}
+          // Since we don't have userId, we need to find the user associated with the room/device
+          // For simplicity, query rooms collection to find matching roomId
+          const roomsSnapshot = await db
+            .collectionGroup('rooms')
+            .where('roomId', '==', roomId)
+            .limit(1)
+            .get();
+
+          if (!roomsSnapshot.empty) {
+            const roomDoc = roomsSnapshot.docs[0];
+            const userId = roomDoc.ref.parent.parent.id; // users/{userId}
+            const deviceRef = db.doc(`users/${userId}/rooms/${roomId}/devices/${deviceId}`);
+
+            await deviceRef.update({
+              status: action,
+              lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            console.log(`Updated Firestore status for device ${deviceId} to ${action}`);
+          } else {
+            console.error(`No room found with roomId ${roomId} for device ${deviceId}`);
+          }
+        } catch (err) {
+          console.error(`Error updating Firestore status for device ${deviceId}:`, err);
+        }
+      } else {
+        console.error('Firestore not initialized, cannot update device status');
+      }
+
       // Remove the executed schedule
       schedules.delete(scheduleId);
       scheduleTimeouts.delete(scheduleId);
-      
+
       console.log(`Schedule ${scheduleId} executed and removed successfully`);
     } catch (err) {
       console.error(`Error executing schedule ${scheduleId}:`, err);
@@ -207,31 +245,30 @@ function scheduleExecution(scheduleId, schedule) {
   }, delay);
 
   scheduleTimeouts.set(scheduleId, timeoutId);
-  console.log(`Schedule ${scheduleId} set for ${scheduleTime.toISOString()} using setTimeout`);
+  console.log(`Schedule ${scheduleId} set for ${scheduleTime.toISOString()}`);
 }
 
 // Cleanup expired schedules periodically
 function cleanupExpiredSchedules() {
   const now = getCurrentUTCTime();
   const expired = [];
-  
+
   schedules.forEach((schedule, scheduleId) => {
     if (new Date(schedule.time) <= now) {
       expired.push(scheduleId);
     }
   });
-  
+
   expired.forEach(scheduleId => {
     console.log(`Removing expired schedule: ${scheduleId}`);
     schedules.delete(scheduleId);
-    
-    // Clean up associated jobs/timeouts
+
     const job = cronJobs.get(scheduleId);
     if (job) {
       job.stop();
       cronJobs.delete(scheduleId);
     }
-    
+
     const timeoutId = scheduleTimeouts.get(scheduleId);
     if (timeoutId) {
       clearTimeout(timeoutId);
@@ -240,16 +277,13 @@ function cleanupExpiredSchedules() {
   });
 }
 
-// Clean up expired schedules every hour
 setInterval(cleanupExpiredSchedules, 60 * 60 * 1000);
-
-
 
 // API: Create a schedule with universal timezone support
 app.post('/schedules', async (req, res) => {
   try {
     const { deviceId, roomId, topic, deviceName, action, time, timezone } = req.body;
-    
+
     if (!deviceId || !roomId || !topic || !deviceName || !action || !time) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -262,12 +296,11 @@ app.post('/schedules', async (req, res) => {
       return res.status(400).json({ error: 'Invalid action: must be "on" or "off"' });
     }
 
-    // Parse the time with universal timezone support
     let scheduleTime;
     try {
       scheduleTime = parseTimeWithTimezone(time, timezone);
     } catch (err) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Invalid time format',
         details: err.message,
         expectedFormats: [
@@ -287,9 +320,7 @@ app.post('/schedules', async (req, res) => {
     console.log(`  Client timezone offset: ${timezone !== undefined ? timezone : 'not provided'} minutes`);
     console.log(`  Parsed schedule time (UTC): ${scheduleTime.toISOString()}`);
     console.log(`  Time difference: ${scheduleTime.getTime() - now.getTime()}ms`);
-    console.log(`  Minutes until execution: ${Math.round((scheduleTime.getTime() - now.getTime()) / 60000)}`);
-    
-    // Additional debugging for timezone issues
+
     if (typeof timezone === 'number') {
       const clientLocalTime = new Date(scheduleTime.getTime() + (timezone * 60 * 1000));
       console.log(`  Client's local time would be: ${clientLocalTime.toISOString()}`);
@@ -299,12 +330,11 @@ app.post('/schedules', async (req, res) => {
       return res.status(400).json({ error: 'Invalid time format - could not parse date' });
     }
 
-    // Add a small buffer (10 seconds) to account for processing time
     const minimumFutureTime = new Date(now.getTime() + 10000);
-    
+
     if (scheduleTime <= minimumFutureTime) {
-      console.log(`Schedule time ${scheduleTime.toISOString()} is not sufficiently in the future (minimum: ${minimumFutureTime.toISOString()})`);
-      return res.status(400).json({ 
+      console.log(`Schedule time ${scheduleTime.toISOString()} is not sufficiently in the future`);
+      return res.status(400).json({
         error: 'Schedule time must be at least 10 seconds in the future',
         times: {
           current: formatTimeForResponse(now.getTime(), timezone),
@@ -322,17 +352,17 @@ app.post('/schedules', async (req, res) => {
       topic,
       deviceName,
       action: action.toLowerCase(),
-      time: scheduleTime.getTime(), // Store as UTC timestamp
-      originalTimezone: timezone // Store original timezone for reference
+      time: scheduleTime.getTime(),
+      originalTimezone: timezone
     };
 
     schedules.set(scheduleId, schedule);
     console.log(`Schedule stored: ${JSON.stringify({...schedule, time: new Date(schedule.time).toISOString()})}`);
-    
+
     scheduleExecution(scheduleId, schedule);
 
     const responseTime = formatTimeForResponse(scheduleTime.getTime(), timezone);
-    res.status(201).json({ 
+    res.status(201).json({
       scheduleId,
       message: 'Schedule created successfully',
       scheduledTime: responseTime,
@@ -351,22 +381,20 @@ app.post('/schedules', async (req, res) => {
 app.delete('/schedules/:scheduleId', async (req, res) => {
   try {
     const { scheduleId } = req.params;
-    
+
     const schedule = schedules.get(scheduleId);
     if (!schedule) {
       return res.status(404).json({ error: 'Schedule not found' });
     }
 
     schedules.delete(scheduleId);
-    
-    // Clean up cron job
+
     const job = cronJobs.get(scheduleId);
     if (job) {
       job.stop();
       cronJobs.delete(scheduleId);
     }
-    
-    // Clean up timeout
+
     const timeoutId = scheduleTimeouts.get(scheduleId);
     if (timeoutId) {
       clearTimeout(timeoutId);
@@ -384,11 +412,11 @@ app.delete('/schedules/:scheduleId', async (req, res) => {
 app.get('/schedules/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { timezone } = req.query; // Optional timezone for response formatting
+    const { timezone } = req.query;
     const clientTimezone = timezone ? parseInt(timezone) : undefined;
-    
+
     const deviceSchedules = [];
-    
+
     schedules.forEach((schedule) => {
       if (schedule.deviceId === deviceId) {
         deviceSchedules.push({
@@ -409,9 +437,9 @@ app.get('/schedules/:deviceId', async (req, res) => {
 // API: Get all schedules with timezone support
 app.get('/schedules', async (req, res) => {
   try {
-    const { timezone } = req.query; // Optional timezone for response formatting
+    const { timezone } = req.query;
     const clientTimezone = timezone ? parseInt(timezone) : undefined;
-    
+
     const allSchedules = Array.from(schedules.values())
       .map(schedule => ({
         ...schedule,
@@ -427,7 +455,7 @@ app.get('/schedules', async (req, res) => {
   }
 });
 
-// Health check endpoint with timezone-aware information
+// Health check endpoint
 app.get('/health', (req, res) => {
   const { timezone } = req.query;
   const clientTimezone = timezone ? parseInt(timezone) : undefined;
@@ -451,7 +479,8 @@ app.get('/health', (req, res) => {
     uptime: Math.round(process.uptime()),
     currentTime: formatTimeForResponse(now.getTime(), clientTimezone),
     serverTimezone: 'UTC',
-    upcomingSchedules: upcomingSchedules.sort((a, b) => a.minutesUntilExecution - b.minutesUntilExecution)
+    upcomingSchedules: upcomingSchedules.sort((a, b) => a.minutesUntilExecution - b.minutesUntilExecution),
+    firebase: firebaseApp ? 'initialized' : 'not initialized'
   };
   res.status(200).json(status);
 });
@@ -484,30 +513,31 @@ app.get('/timezone', (req, res) => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
-  
-  // Stop all cron jobs
+
   cronJobs.forEach((job, scheduleId) => {
     job.stop();
     console.log(`Stopped cron job: ${scheduleId}`);
   });
   cronJobs.clear();
-  
-  // Clear all timeouts
+
   scheduleTimeouts.forEach((timeoutId, scheduleId) => {
     clearTimeout(timeoutId);
     console.log(`Cleared timeout: ${scheduleId}`);
   });
   scheduleTimeouts.clear();
 
-  // Close MQTT connection
   if (mqttClient) {
     mqttClient.end();
+  }
+
+  if (firebaseApp) {
+    await admin.app().delete();
+    console.log('Firebase Admin SDK shut down');
   }
 
   process.exit(0);
 });
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
   process.exit(1);
@@ -520,11 +550,10 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const PORT = process.env.PORT || 3000;
 
-// Initialize everything
 function startServer() {
   try {
     initializeMQTT();
-    
+
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server running on port ${PORT}`);
       console.log(`Health check available at http://localhost:${PORT}/health`);
