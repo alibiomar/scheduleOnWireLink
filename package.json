@@ -1,0 +1,22 @@
+{
+  "name": "device-scheduler-server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "firebase-admin": "^13.4.0",
+    "mqtt": "^5.13.1",
+    "node-cron": "^4.1.0",
+    "sqlite": "^4.0.25",
+    "sqlite3": "^5.1.7"
+  }
+}
