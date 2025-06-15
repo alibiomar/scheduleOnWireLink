@@ -18,6 +18,62 @@ function isValidTopic(topic) {
   return topicRegex.test(topic);
 }
 
+// Universal timezone utility functions
+function parseTimeWithTimezone(timeInput, timezoneOffset) {
+  let parsedTime;
+  
+  // Handle various time input formats
+  if (typeof timeInput === 'string') {
+    // If it's an ISO string with timezone info, use it directly
+    if (timeInput.includes('T') && (timeInput.includes('Z') || timeInput.includes('+') || timeInput.includes('-'))) {
+      parsedTime = new Date(timeInput);
+    } else {
+      // Treat as local time string and parse
+      parsedTime = new Date(timeInput);
+    }
+  } else if (typeof timeInput === 'number') {
+    // Treat as timestamp
+    parsedTime = new Date(timeInput);
+  } else {
+    throw new Error('Invalid time format');
+  }
+
+  // If timezone offset is provided (in minutes), convert to UTC
+  if (typeof timezoneOffset === 'number') {
+    // Note: JavaScript getTimezoneOffset() returns positive values for timezones west of UTC
+    // But we expect the client to send negative values for timezones west of UTC (standard convention)
+    // So we subtract the offset to convert local time to UTC
+    const offsetMs = timezoneOffset * 60 * 1000;
+    parsedTime = new Date(parsedTime.getTime() - offsetMs);
+  }
+
+  return parsedTime;
+}
+
+function formatTimeForResponse(utcTimestamp, clientTimezoneOffset) {
+  const utcTime = new Date(utcTimestamp);
+  
+  // If client timezone offset is provided, show time in client's timezone
+  if (typeof clientTimezoneOffset === 'number') {
+    const localTime = new Date(utcTime.getTime() + (clientTimezoneOffset * 60 * 1000));
+    return {
+      utc: utcTime.toISOString(),
+      local: localTime.toISOString(),
+      timezone: `UTC${clientTimezoneOffset >= 0 ? '+' : ''}${Math.floor(clientTimezoneOffset / 60)}:${Math.abs(clientTimezoneOffset % 60).toString().padStart(2, '0')}`
+    };
+  }
+  
+  return {
+    utc: utcTime.toISOString(),
+    local: utcTime.toISOString(),
+    timezone: 'UTC'
+  };
+}
+
+function getCurrentUTCTime() {
+  return new Date();
+}
+
 // Initialize MQTT Client
 let mqttClient;
 function initializeMQTT() {
@@ -89,11 +145,11 @@ const scheduleTimeouts = new Map();
 function scheduleExecution(scheduleId, schedule) {
   const { time, action, topic } = schedule;
   const scheduleTime = new Date(time);
-  const now = new Date();
+  const now = getCurrentUTCTime();
 
   console.log(`Processing schedule ${scheduleId}:`);
-  console.log(`  Current time: ${now.toISOString()}`);
-  console.log(`  Schedule time: ${scheduleTime.toISOString()}`);
+  console.log(`  Current UTC time: ${now.toISOString()}`);
+  console.log(`  Schedule UTC time: ${scheduleTime.toISOString()}`);
   console.log(`  Action: ${action} on ${topic}`);
 
   // Validate schedule time is in the future
@@ -152,7 +208,7 @@ function scheduleExecution(scheduleId, schedule) {
 
 // Cleanup expired schedules periodically
 function cleanupExpiredSchedules() {
-  const now = new Date();
+  const now = getCurrentUTCTime();
   const expired = [];
   
   schedules.forEach((schedule, scheduleId) => {
@@ -224,7 +280,7 @@ app.post('/devices', async (req, res) => {
   }
 });
 
-// API: Create a schedule
+// API: Create a schedule with universal timezone support
 app.post('/schedules', async (req, res) => {
   try {
     const { deviceId, roomId, topic, deviceName, action, time, timezone } = req.body;
@@ -241,32 +297,35 @@ app.post('/schedules', async (req, res) => {
       return res.status(400).json({ error: 'Invalid action: must be "on" or "off"' });
     }
 
-    // Parse the time - handle both ISO strings and timestamps
+    // Parse the time with universal timezone support
     let scheduleTime;
-    if (typeof time === 'string') {
-      scheduleTime = new Date(time);
-    } else {
-      scheduleTime = new Date(time);
+    try {
+      scheduleTime = parseTimeWithTimezone(time, timezone);
+    } catch (err) {
+      return res.status(400).json({ 
+        error: 'Invalid time format',
+        details: err.message,
+        expectedFormats: [
+          'ISO string with timezone: "2024-01-15T14:30:00Z"',
+          'ISO string with offset: "2024-01-15T14:30:00+05:00"',
+          'Local time string with timezone offset: "2024-01-15T14:30:00" + timezone: -300',
+          'Unix timestamp: 1705315800000'
+        ]
+      });
     }
 
-    // If timezone offset is provided, adjust the time
-    if (timezone !== undefined) {
-      const offsetMs = timezone * 60 * 1000;
-      scheduleTime = new Date(scheduleTime.getTime() - offsetMs);
-    }
+    const now = getCurrentUTCTime();
 
-    const now = new Date();
-
-    console.log('Creating schedule:');
-    console.log(`  Current time (UTC): ${now.toISOString()}`);
-    console.log(`  Original time: ${time}`);
+    console.log('Creating schedule with universal timezone support:');
+    console.log(`  Current UTC time: ${now.toISOString()}`);
+    console.log(`  Original time input: ${time}`);
+    console.log(`  Timezone offset: ${timezone || 'auto-detected/none'} minutes`);
     console.log(`  Parsed schedule time (UTC): ${scheduleTime.toISOString()}`);
-    console.log(`  Timezone offset: ${timezone || 'none'} minutes`);
     console.log(`  Time difference: ${scheduleTime.getTime() - now.getTime()}ms`);
     console.log(`  Minutes until execution: ${Math.round((scheduleTime.getTime() - now.getTime()) / 60000)}`);
 
     if (isNaN(scheduleTime.getTime())) {
-      return res.status(400).json({ error: 'Invalid time format' });
+      return res.status(400).json({ error: 'Invalid time format - could not parse date' });
     }
 
     // Add a small buffer (10 seconds) to account for processing time
@@ -276,9 +335,11 @@ app.post('/schedules', async (req, res) => {
       console.log(`Schedule time ${scheduleTime.toISOString()} is not sufficiently in the future (minimum: ${minimumFutureTime.toISOString()})`);
       return res.status(400).json({ 
         error: 'Schedule time must be at least 10 seconds in the future',
-        currentTime: now.toISOString(),
-        scheduleTime: scheduleTime.toISOString(),
-        minimumTime: minimumFutureTime.toISOString()
+        times: {
+          current: formatTimeForResponse(now.getTime(), timezone),
+          requested: formatTimeForResponse(scheduleTime.getTime(), timezone),
+          minimum: formatTimeForResponse(minimumFutureTime.getTime(), timezone)
+        }
       });
     }
 
@@ -290,22 +351,24 @@ app.post('/schedules', async (req, res) => {
       topic,
       deviceName,
       action: action.toLowerCase(),
-      time: scheduleTime.getTime()
+      time: scheduleTime.getTime(), // Store as UTC timestamp
+      originalTimezone: timezone // Store original timezone for reference
     };
 
     schedules.set(scheduleId, schedule);
-    console.log(`Schedule stored: ${JSON.stringify(schedule)}`);
+    console.log(`Schedule stored: ${JSON.stringify({...schedule, time: new Date(schedule.time).toISOString()})}`);
     
     scheduleExecution(scheduleId, schedule);
 
+    const responseTime = formatTimeForResponse(scheduleTime.getTime(), timezone);
     res.status(201).json({ 
       scheduleId,
       message: 'Schedule created successfully',
-      scheduledTime: scheduleTime.toISOString(),
-      currentTime: now.toISOString(),
+      scheduledTime: responseTime,
+      currentTime: formatTimeForResponse(now.getTime(), timezone),
       delayMinutes: Math.round((scheduleTime.getTime() - now.getTime()) / 60000),
-      originalTime: time,
-      timezoneOffset: timezone || 0
+      originalTimeInput: time,
+      detectedTimezone: timezone ? `UTC${timezone >= 0 ? '+' : ''}${Math.floor(Math.abs(timezone) / 60)}:${(Math.abs(timezone) % 60).toString().padStart(2, '0')}` : 'auto/UTC'
     });
   } catch (err) {
     console.error('Error creating schedule:', err);
@@ -346,17 +409,21 @@ app.delete('/schedules/:scheduleId', async (req, res) => {
   }
 });
 
-// API: Get schedules for a device
+// API: Get schedules for a device with timezone support
 app.get('/schedules/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
+    const { timezone } = req.query; // Optional timezone for response formatting
+    const clientTimezone = timezone ? parseInt(timezone) : undefined;
+    
     const deviceSchedules = [];
     
     schedules.forEach((schedule) => {
       if (schedule.deviceId === deviceId) {
         deviceSchedules.push({
           ...schedule,
-          scheduledTime: new Date(schedule.time).toISOString()
+          scheduledTime: formatTimeForResponse(schedule.time, clientTimezone),
+          originalTimezone: schedule.originalTimezone
         });
       }
     });
@@ -368,13 +435,17 @@ app.get('/schedules/:deviceId', async (req, res) => {
   }
 });
 
-// API: Get all schedules
+// API: Get all schedules with timezone support
 app.get('/schedules', async (req, res) => {
   try {
+    const { timezone } = req.query; // Optional timezone for response formatting
+    const clientTimezone = timezone ? parseInt(timezone) : undefined;
+    
     const allSchedules = Array.from(schedules.values())
       .map(schedule => ({
         ...schedule,
-        scheduledTime: new Date(schedule.time).toISOString()
+        scheduledTime: formatTimeForResponse(schedule.time, clientTimezone),
+        originalTimezone: schedule.originalTimezone
       }))
       .sort((a, b) => a.time - b.time);
 
@@ -457,16 +528,19 @@ app.post('/devices/:deviceId/control', async (req, res) => {
   }
 });
 
-// Health check endpoint
+// Health check endpoint with timezone-aware information
 app.get('/health', (req, res) => {
-  const now = new Date();
+  const { timezone } = req.query;
+  const clientTimezone = timezone ? parseInt(timezone) : undefined;
+  const now = getCurrentUTCTime();
   const schedulesArray = Array.from(schedules.values());
   const upcomingSchedules = schedulesArray.map(s => ({
     id: s.id,
     deviceName: s.deviceName,
     action: s.action,
-    scheduledTime: new Date(s.time).toISOString(),
-    minutesUntilExecution: Math.round((s.time - now.getTime()) / 60000)
+    scheduledTime: formatTimeForResponse(s.time, clientTimezone),
+    minutesUntilExecution: Math.round((s.time - now.getTime()) / 60000),
+    originalTimezone: s.originalTimezone
   }));
 
   const status = {
@@ -476,7 +550,8 @@ app.get('/health', (req, res) => {
     activeSchedules: schedules.size,
     timeouts: scheduleTimeouts.size,
     uptime: Math.round(process.uptime()),
-    currentTime: now.toISOString(),
+    currentTime: formatTimeForResponse(now.getTime(), clientTimezone),
+    serverTimezone: 'UTC',
     upcomingSchedules: upcomingSchedules.sort((a, b) => a.minutesUntilExecution - b.minutesUntilExecution)
   };
   res.status(200).json(status);
@@ -485,6 +560,26 @@ app.get('/health', (req, res) => {
 // Keep-alive endpoint for Render
 app.get('/ping', (req, res) => {
   res.status(200).json({ message: 'pong', timestamp: new Date().toISOString() });
+});
+
+// API: Get server timezone info
+app.get('/timezone', (req, res) => {
+  const now = new Date();
+  res.status(200).json({
+    serverTime: {
+      utc: now.toISOString(),
+      timestamp: now.getTime()
+    },
+    info: {
+      message: 'Server operates in UTC. Send timezone offset in minutes for local time conversion.',
+      examples: {
+        'UTC+0': 0,
+        'UTC+1 (CET)': 60,
+        'UTC-5 (EST)': -300,
+        'UTC+5:30 (IST)': 330
+      }
+    }
+  });
 });
 
 // Graceful shutdown
@@ -535,6 +630,8 @@ function startServer() {
       console.log(`Server running on port ${PORT}`);
       console.log(`Health check available at http://localhost:${PORT}/health`);
       console.log(`Ping endpoint available at http://localhost:${PORT}/ping`);
+      console.log(`Timezone info available at http://localhost:${PORT}/timezone`);
+      console.log(`Server operates in UTC timezone`);
     });
   } catch (err) {
     console.error('Failed to start server:', err);
