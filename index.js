@@ -91,110 +91,63 @@ function scheduleExecution(scheduleId, schedule) {
   const scheduleTime = new Date(time);
   const now = new Date();
 
+  console.log(`Processing schedule ${scheduleId}:`);
+  console.log(`  Current time: ${now.toISOString()}`);
+  console.log(`  Schedule time: ${scheduleTime.toISOString()}`);
+  console.log(`  Action: ${action} on ${topic}`);
+
   // Validate schedule time is in the future
   if (scheduleTime <= now) {
-    console.log(`Schedule ${scheduleId} is in the past, removing`);
+    console.log(`Schedule ${scheduleId} is in the past (${scheduleTime.toISOString()} <= ${now.toISOString()}), removing`);
     schedules.delete(scheduleId);
     return;
   }
 
   const delay = scheduleTime.getTime() - now.getTime();
+  console.log(`Schedule ${scheduleId} will execute in ${Math.round(delay / 1000)} seconds (${Math.round(delay / 60000)} minutes)`);
   
-  // Use setTimeout for near-term schedules (within 24 hours)
-  if (delay <= 24 * 60 * 60 * 1000) {
-    console.log(`Scheduling execution for ${scheduleId} in ${Math.round(delay / 1000)} seconds`);
-    
-    const timeoutId = setTimeout(async () => {
-      try {
-        console.log(`Executing schedule ${scheduleId}: ${action} on ${topic}`);
-        
-        if (!isValidTopic(topic)) {
-          throw new Error(`Invalid topic: ${topic}`);
-        }
+  // Use setTimeout for schedules (more reliable than cron on cloud platforms)
+  const timeoutId = setTimeout(async () => {
+    try {
+      console.log(`Executing schedule ${scheduleId}: ${action} on ${topic}`);
+      
+      if (!isValidTopic(topic)) {
+        throw new Error(`Invalid topic: ${topic}`);
+      }
 
-        // Publish MQTT message
-        if (mqttClient && mqttClient.connected) {
-          mqttClient.publish(topic, action, { qos: 0 }, (err) => {
-            if (err) {
-              console.error(`Error publishing to ${topic}:`, err);
-            } else {
-              console.log(`Published ${action} to ${topic}`);
-            }
-          });
-        } else {
-          console.error('MQTT client not connected');
-        }
-
-        // Update device status in memory
-        devices.forEach((device, deviceId) => {
-          if (device.topic === topic) {
-            device.status = action;
+      // Publish MQTT message
+      if (mqttClient && mqttClient.connected) {
+        mqttClient.publish(topic, action, { qos: 0 }, (err) => {
+          if (err) {
+            console.error(`Error publishing to ${topic}:`, err);
+          } else {
+            console.log(`Successfully published ${action} to ${topic}`);
           }
         });
-        
-        // Remove the executed schedule
-        schedules.delete(scheduleId);
-        scheduleTimeouts.delete(scheduleId);
-        
-        console.log(`Schedule ${scheduleId} executed and removed`);
-      } catch (err) {
-        console.error(`Error executing schedule ${scheduleId}:`, err);
+      } else {
+        console.error('MQTT client not connected, cannot publish message');
       }
-    }, delay);
 
-    scheduleTimeouts.set(scheduleId, timeoutId);
-  } else {
-    // For longer-term schedules, use cron with daily check
-    const cronExpression = `${scheduleTime.getSeconds()} ${scheduleTime.getMinutes()} ${scheduleTime.getHours()} ${scheduleTime.getDate()} ${scheduleTime.getMonth() + 1} *`;
-    
-    console.log(`Scheduling cron job ${scheduleId} with expression: ${cronExpression}`);
-
-    const job = cron.schedule(cronExpression, async () => {
-      try {
-        console.log(`Executing schedule ${scheduleId}: ${action} on ${topic}`);
-        
-        if (!isValidTopic(topic)) {
-          throw new Error(`Invalid topic: ${topic}`);
+      // Update device status in memory
+      devices.forEach((device, deviceId) => {
+        if (device.topic === topic) {
+          device.status = action;
+          console.log(`Updated device ${deviceId} status to ${action}`);
         }
+      });
+      
+      // Remove the executed schedule
+      schedules.delete(scheduleId);
+      scheduleTimeouts.delete(scheduleId);
+      
+      console.log(`Schedule ${scheduleId} executed and removed successfully`);
+    } catch (err) {
+      console.error(`Error executing schedule ${scheduleId}:`, err);
+    }
+  }, delay);
 
-        // Publish MQTT message
-        if (mqttClient && mqttClient.connected) {
-          mqttClient.publish(topic, action, { qos: 0 }, (err) => {
-            if (err) {
-              console.error(`Error publishing to ${topic}:`, err);
-            } else {
-              console.log(`Published ${action} to ${topic}`);
-            }
-          });
-        } else {
-          console.error('MQTT client not connected');
-        }
-
-        // Update device status in memory
-        devices.forEach((device, deviceId) => {
-          if (device.topic === topic) {
-            device.status = action;
-          }
-        });
-        
-        // Remove the executed schedule
-        schedules.delete(scheduleId);
-        cronJobs.delete(scheduleId);
-        job.stop();
-        
-        console.log(`Schedule ${scheduleId} executed and removed`);
-      } catch (err) {
-        console.error(`Error executing schedule ${scheduleId}:`, err);
-      }
-    }, {
-      scheduled: true,
-      timezone: "UTC"
-    });
-
-    cronJobs.set(scheduleId, job);
-  }
-
-  console.log(`Schedule ${scheduleId} set for ${scheduleTime.toISOString()}`);
+  scheduleTimeouts.set(scheduleId, timeoutId);
+  console.log(`Schedule ${scheduleId} set for ${scheduleTime.toISOString()} using setTimeout`);
 }
 
 // Cleanup expired schedules periodically
@@ -291,12 +244,22 @@ app.post('/schedules', async (req, res) => {
     const scheduleTime = new Date(time);
     const now = new Date();
 
+    console.log('Creating schedule:');
+    console.log(`  Current time: ${now.toISOString()}`);
+    console.log(`  Schedule time: ${scheduleTime.toISOString()}`);
+    console.log(`  Time difference: ${scheduleTime.getTime() - now.getTime()}ms`);
+
     if (isNaN(scheduleTime.getTime())) {
       return res.status(400).json({ error: 'Invalid time format' });
     }
 
     if (scheduleTime <= now) {
-      return res.status(400).json({ error: 'Schedule time must be in the future' });
+      console.log(`Schedule time ${scheduleTime.toISOString()} is not in the future (current: ${now.toISOString()})`);
+      return res.status(400).json({ 
+        error: 'Schedule time must be in the future',
+        currentTime: now.toISOString(),
+        scheduleTime: scheduleTime.toISOString()
+      });
     }
 
     const scheduleId = `${deviceId}_${Date.now()}`;
@@ -311,12 +274,16 @@ app.post('/schedules', async (req, res) => {
     };
 
     schedules.set(scheduleId, schedule);
+    console.log(`Schedule stored: ${JSON.stringify(schedule)}`);
+    
     scheduleExecution(scheduleId, schedule);
 
     res.status(201).json({ 
       scheduleId,
       message: 'Schedule created successfully',
-      scheduledTime: scheduleTime.toISOString()
+      scheduledTime: scheduleTime.toISOString(),
+      currentTime: now.toISOString(),
+      delayMinutes: Math.round((scheduleTime.getTime() - now.getTime()) / 60000)
     });
   } catch (err) {
     console.error('Error creating schedule:', err);
@@ -470,14 +437,25 @@ app.post('/devices/:deviceId/control', async (req, res) => {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
+  const now = new Date();
+  const schedulesArray = Array.from(schedules.values());
+  const upcomingSchedules = schedulesArray.map(s => ({
+    id: s.id,
+    deviceName: s.deviceName,
+    action: s.action,
+    scheduledTime: new Date(s.time).toISOString(),
+    minutesUntilExecution: Math.round((s.time - now.getTime()) / 60000)
+  }));
+
   const status = {
     server: 'running',
     mqtt: mqttClient && mqttClient.connected ? 'connected' : 'disconnected',
     devices: devices.size,
     activeSchedules: schedules.size,
-    cronJobs: cronJobs.size,
     timeouts: scheduleTimeouts.size,
-    uptime: process.uptime()
+    uptime: Math.round(process.uptime()),
+    currentTime: now.toISOString(),
+    upcomingSchedules: upcomingSchedules.sort((a, b) => a.minutesUntilExecution - b.minutesUntilExecution)
   };
   res.status(200).json(status);
 });
