@@ -2,7 +2,7 @@ const express = require('express');
 const cron = require('node-cron');
 const mqtt = require('mqtt');
 const dotenv = require('dotenv');
-const admin = require('firebase-admin'); // Add Firebase Admin SDK
+const admin = require('firebase-admin');
 
 dotenv.config();
 
@@ -155,7 +155,7 @@ const scheduleTimeouts = new Map();
 
 // Schedule execution using setTimeout
 async function scheduleExecution(scheduleId, schedule) {
-  const { time, action, topic, deviceId, roomId } = schedule;
+  const { time, action, topic, deviceId, roomId, userId } = schedule;
   const scheduleTime = new Date(time);
   const now = getCurrentUTCTime();
 
@@ -163,6 +163,7 @@ async function scheduleExecution(scheduleId, schedule) {
   console.log(`  Current UTC time: ${now.toISOString()}`);
   console.log(`  Schedule UTC time: ${scheduleTime.toISOString()}`);
   console.log(`  Action: ${action} on ${topic}`);
+  console.log(`  DeviceID: ${deviceId}, RoomID: ${roomId}, UserID: ${userId || 'not provided'}`);
 
   if (scheduleTime <= now) {
     console.log(`Schedule ${scheduleId} is in the past, removing`);
@@ -203,35 +204,25 @@ async function scheduleExecution(scheduleId, schedule) {
       });
 
       // Update device status in Firestore
-      if (db) {
+      if (db && userId) {
         try {
-          // Assume device is stored under users/{userId}/rooms/{roomId}/devices/{deviceId}
-          // Since we don't have userId, we need to find the user associated with the room/device
-          // For simplicity, query rooms collection to find matching roomId
-          const roomsSnapshot = await db
-            .collectionGroup('rooms')
-            .where('roomId', '==', roomId)
-            .limit(1)
-            .get();
-
-          if (!roomsSnapshot.empty) {
-            const roomDoc = roomsSnapshot.docs[0];
-            const userId = roomDoc.ref.parent.parent.id; // users/{userId}
-            const deviceRef = db.doc(`users/${userId}/rooms/${roomId}/devices/${deviceId}`);
-
-            await deviceRef.update({
-              status: action,
-              lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-            });
-            console.log(`Updated Firestore status for device ${deviceId} to ${action}`);
-          } else {
-            console.error(`No room found with roomId ${roomId} for device ${deviceId}`);
+          const deviceRef = db.doc(`users/${userId}/rooms/${roomId}/devices/${deviceId}`);
+          const deviceDoc = await deviceRef.get();
+          if (!deviceDoc.exists) {
+            console.error(`Device document does not exist at: users/${userId}/rooms/${roomId}/devices/${deviceId}`);
+            return;
           }
+          await deviceRef.update({
+            status: action,
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(`Updated Firestore status for device ${deviceId} to ${action}`);
         } catch (err) {
-          console.error(`Error updating Firestore status for device ${deviceId}:`, err);
+          console.error(`Error updating Firestore status for device ${deviceId}:`, err.message);
+          console.error(err.stack);
         }
       } else {
-        console.error('Firestore not initialized, cannot update device status');
+        console.error(`Firestore not initialized or userId missing for device ${deviceId}`);
       }
 
       // Remove the executed schedule
@@ -240,7 +231,8 @@ async function scheduleExecution(scheduleId, schedule) {
 
       console.log(`Schedule ${scheduleId} executed and removed successfully`);
     } catch (err) {
-      console.error(`Error executing schedule ${scheduleId}:`, err);
+      console.error(`Error executing schedule ${scheduleId}:`, err.message);
+      console.error(err.stack);
     }
   }, delay);
 
@@ -282,9 +274,9 @@ setInterval(cleanupExpiredSchedules, 60 * 60 * 1000);
 // API: Create a schedule with universal timezone support
 app.post('/schedules', async (req, res) => {
   try {
-    const { deviceId, roomId, topic, deviceName, action, time, timezone } = req.body;
+    const { deviceId, roomId, topic, deviceName, action, time, timezone, userId } = req.body;
 
-    if (!deviceId || !roomId || !topic || !deviceName || !action || !time) {
+    if (!deviceId || !roomId || !topic || !deviceName || !action || !time || !userId) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
@@ -320,6 +312,7 @@ app.post('/schedules', async (req, res) => {
     console.log(`  Client timezone offset: ${timezone !== undefined ? timezone : 'not provided'} minutes`);
     console.log(`  Parsed schedule time (UTC): ${scheduleTime.toISOString()}`);
     console.log(`  Time difference: ${scheduleTime.getTime() - now.getTime()}ms`);
+    console.log(`  DeviceID: ${deviceId}, RoomID: ${roomId}, UserID: ${userId}`);
 
     if (typeof timezone === 'number') {
       const clientLocalTime = new Date(scheduleTime.getTime() + (timezone * 60 * 1000));
@@ -353,7 +346,8 @@ app.post('/schedules', async (req, res) => {
       deviceName,
       action: action.toLowerCase(),
       time: scheduleTime.getTime(),
-      originalTimezone: timezone
+      originalTimezone: timezone,
+      userId
     };
 
     schedules.set(scheduleId, schedule);
@@ -372,7 +366,8 @@ app.post('/schedules', async (req, res) => {
       detectedTimezone: timezone ? `UTC${timezone >= 0 ? '+' : ''}${Math.floor(Math.abs(timezone) / 60)}:${(Math.abs(timezone) % 60).toString().padStart(2, '0')}` : 'auto/UTC'
     });
   } catch (err) {
-    console.error('Error creating schedule:', err);
+    console.error('Error creating schedule:', err.message);
+    console.error(err.stack);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -403,7 +398,8 @@ app.delete('/schedules/:scheduleId', async (req, res) => {
 
     res.status(200).json({ message: 'Schedule deleted successfully' });
   } catch (err) {
-    console.error('Error deleting schedule:', err);
+    console.error('Error deleting schedule:', err.message);
+    console.error(err.stack);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -429,7 +425,8 @@ app.get('/schedules/:deviceId', async (req, res) => {
 
     res.status(200).json(deviceSchedules);
   } catch (err) {
-    console.error('Error fetching schedules:', err);
+    console.error('Error fetching schedules:', err.message);
+    console.error(err.stack);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -450,7 +447,8 @@ app.get('/schedules', async (req, res) => {
 
     res.status(200).json(allSchedules);
   } catch (err) {
-    console.error('Error fetching all schedules:', err);
+    console.error('Error fetching all schedules:', err.message);
+    console.error(err.stack);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -539,7 +537,8 @@ process.on('SIGINT', async () => {
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
+  console.error('Uncaught Exception:', err.message);
+  console.error(err.stack);
   process.exit(1);
 });
 
@@ -562,7 +561,8 @@ function startServer() {
       console.log(`Server operates in UTC timezone`);
     });
   } catch (err) {
-    console.error('Failed to start server:', err);
+    console.error('Failed to start server:', err.message);
+    console.error(err.stack);
     process.exit(1);
   }
 }
