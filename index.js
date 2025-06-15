@@ -21,40 +21,37 @@ function isValidTopic(topic) {
 // Universal timezone utility functions
 function parseTimeWithTimezone(timeInput, timezoneOffset) {
   let parsedTime;
-  
-  // Handle various time input formats
-  if (typeof timeInput === 'string') {
-    // If it's an ISO string with timezone info, use it directly
-    if (timeInput.includes('T') && (timeInput.includes('Z') || timeInput.includes('+') || timeInput.includes('-'))) {
+
+  try {
+    if (typeof timeInput === 'string') {
+      // Handle ISO string
+      parsedTime = new Date(timeInput);
+
+      if (isNaN(parsedTime.getTime())) {
+        throw new Error('Invalid time format');
+      }
+
+      // If timezoneOffset is provided (in minutes), adjust to UTC
+      if (typeof timezoneOffset === 'number') {
+        const offsetMs = timezoneOffset * 60 * 1000;
+        // Subtract the client's timezone offset to convert local time to UTC
+        parsedTime = new Date(parsedTime.getTime() - offsetMs);
+      }
+    } else if (typeof timeInput === 'number') {
+      // Treat as timestamp (assumed to be UTC)
       parsedTime = new Date(timeInput);
     } else {
-      // For strings without timezone info, we need to be more explicit
-      // Check if it looks like an ISO string without timezone
-      if (timeInput.includes('T')) {
-        // If no timezone offset is provided, treat the time as if it's already in the client's intended timezone
-        // This means the client sent their local time, so we parse it as UTC first
-        parsedTime = new Date(timeInput.endsWith('Z') ? timeInput : timeInput + 'Z');
-        
-        // If timezone offset is provided, we need to adjust from the client's timezone to UTC
-        if (typeof timezoneOffset === 'number') {
-          // The client sent their local time, so we need to convert it to UTC
-          // timezoneOffset is the client's offset from UTC in minutes
-          const offsetMs = timezoneOffset * 60 * 1000;
-          parsedTime = new Date(parsedTime.getTime() - offsetMs);
-        }
-      } else {
-        // Regular date string parsing
-        parsedTime = new Date(timeInput);
-      }
+      throw new Error('Invalid time format');
     }
-  } else if (typeof timeInput === 'number') {
-    // Treat as timestamp
-    parsedTime = new Date(timeInput);
-  } else {
-    throw new Error('Invalid time format');
-  }
 
-  return parsedTime;
+    if (isNaN(parsedTime.getTime())) {
+      throw new Error('Invalid time format - could not parse date');
+    }
+
+    return parsedTime;
+  } catch (err) {
+    throw new Error(`Failed to parse time: ${err.message}`);
+  }
 }
 
 function formatTimeForResponse(utcTimestamp, clientTimezoneOffset) {
